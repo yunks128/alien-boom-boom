@@ -85,7 +85,7 @@ MAX_RANKINGS = 10
 # Shared online ranking (Firebase Realtime Database). Paste the database address here, e.g.
 # "https://alien-boom-boom-default-rtdb.firebaseio.com". Leave it empty to keep rankings
 # on each device only.
-LEADERBOARD_URL = ""
+LEADERBOARD_URL = "https://alien-boom-boom-default-rtdb.firebaseio.com"
 LEADERBOARD_TIMEOUT_S = 5
 MAX_NAME_LEN = 16
 GAME_OVER_PAUSE_MS = 1500  # how long GAME OVER shows before the name screen
@@ -685,6 +685,7 @@ class App:
             rankings = fetch_online_rankings()
             if rankings is not None:
                 self.online_rankings = rankings
+            print("online ranking:", "unavailable" if rankings is None else f"{len(rankings)} scores")
 
         if IS_WEB:
             work()  # browsers have no threads here; the request is quick
