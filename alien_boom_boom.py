@@ -1,6 +1,7 @@
 """Alien Boom Boom - quick prototype.
 
 Arrow keys: move    Space: shoot    B: fire a bomb    Esc: back to menu
+Touch / mouse: tap or hold to shoot, swipe left and right to move.
 Coins, shop upgrades and rankings are saved in alien_boom_boom_save.json.
 """
 import asyncio
@@ -22,9 +23,12 @@ LASER_SPEED = 11
 SHOT_COOLDOWN_MS = 220
 START_LIVES = 3
 INVINCIBLE_MS = 1500  # grace period after getting hit
+SWIPE_SPEED = 1.3  # how far the rocket moves compared with your finger
+DOUBLE_TAP_MS = 300  # two taps this close together (in time and place) fire a bomb
+DOUBLE_TAP_PX = 60
 
 # Level tuning: level 1 is slow and easy, each level adds speed and spawns.
-ALIEN_BASE_MIN_SPEED, ALIEN_BASE_MAX_SPEED = 0.8, 1.5
+ALIEN_BASE_MIN_SPEED, ALIEN_BASE_MAX_SPEED = 1.6, 2.6
 ALIEN_SPEED_PER_LEVEL = 0.35
 ALIEN_SPEED_CAP = 7.0
 
@@ -225,6 +229,7 @@ class Game:
         self.flash_start = -BOMB_FLASH_MS
         self.hit_time = -INVINCIBLE_MS
         self.game_over = False
+        self.touching = False  # a finger (or the mouse button) is held down
 
     def kills_needed(self):
         return KILLS_BASE + KILLS_PER_LEVEL * (self.level - 1)
@@ -317,7 +322,7 @@ class Game:
         """hover_y is where the alien parks to shoot; None means it dives straight down."""
         return {
             "rect": rect, "x": float(rect.x), "y": float(rect.y), "speed": speed, "img": img,
-            "hp": hp, "hover_y": hover_y, "dx": random.choice((-1, 1)) * speed * 0.6,
+            "hp": hp, "hover_y": hover_y, "dx": random.choice((-1, 1)) * speed * 0.9,
             "next_shot": None,
         }
 
@@ -410,7 +415,7 @@ class Game:
         if keys[pygame.K_DOWN]:
             self.player.y += self.speed
         self.player.clamp_ip(pygame.Rect(0, 0, WIDTH, HEIGHT))
-        if keys[pygame.K_SPACE]:
+        if keys[pygame.K_SPACE] or self.touching:
             self.shoot(now)
 
         spawn_gap = max(SPAWN_MIN_MS, SPAWN_BASE_MS - SPAWN_STEP_MS * (self.level - 1))
@@ -593,8 +598,22 @@ class App:
         self.earned = 0
         self.my_entry = None  # the ranking row from the game just played
         self.running = True
+        self.touch_x = 0  # where the finger was last, to measure swipes
+        self.last_tap = (-DOUBLE_TAP_MS, 0, 0)  # (time, x, y) of the last tap, to spot double taps
 
     # ----- actions -----
+
+    def leave_game(self):
+        self.bank_coins()  # quitting early still keeps your coins
+        self.state = "menu"
+
+    def type_name(self):
+        """Phones have no keyboard for the game, so ask with the browser's own text box."""
+        from platform import window
+        name = window.prompt("Your pilot name:", self.name)
+        if name:
+            self.name = str(name).strip()[:MAX_NAME_LEN]
+            self.name_fresh = False
 
     def start_game(self):
         self.game.reset()
@@ -655,6 +674,25 @@ class App:
                 if rect.collidepoint(event.pos):
                     action()
                     break
+            else:
+                if self.state == "play":
+                    # a tap shoots (hold to keep shooting); swiping moves the rocket
+                    self.game.touching = True
+                    self.touch_x = event.pos[0]
+                    near = abs(event.pos[0] - self.last_tap[1]) < DOUBLE_TAP_PX and \
+                        abs(event.pos[1] - self.last_tap[2]) < DOUBLE_TAP_PX
+                    if now - self.last_tap[0] <= DOUBLE_TAP_MS and near:
+                        self.game.use_bomb(now)
+                        self.last_tap = (-DOUBLE_TAP_MS, 0, 0)  # a third tap starts over
+                    else:
+                        self.last_tap = (now, *event.pos)
+        elif event.type == pygame.MOUSEMOTION:
+            if self.state == "play" and self.game.touching and not self.game.game_over:
+                self.game.player.x += round((event.pos[0] - self.touch_x) * SWIPE_SPEED)
+                self.game.player.clamp_ip(pygame.Rect(0, 0, WIDTH, HEIGHT))
+                self.touch_x = event.pos[0]
+        elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self.game.touching = False
         elif event.type == pygame.KEYDOWN:
             self.handle_key(event, now)
 
@@ -674,8 +712,7 @@ class App:
                 self.state = "menu"
         elif self.state == "play":
             if key == pygame.K_ESCAPE:
-                self.bank_coins()  # quitting early still keeps your coins
-                self.state = "menu"
+                self.leave_game()
             elif key == pygame.K_b:
                 self.game.use_bomb(now)
         elif self.state == "name":
@@ -744,7 +781,7 @@ class App:
         self.text(f"Coins: {self.save['coins']}", (WIDTH // 2, 490), color=YELLOW)
         self.text("TOP PILOTS", (WIDTH // 2, 535), color=CYAN)
         self.draw_rankings(560, 5)
-        self.text("Arrows move   Space shoots   B bomb", (WIDTH // 2, HEIGHT - 30), self.small_font, GRAY)
+        self.text("Arrows or swipe to move   Space or tap to shoot", (WIDTH // 2, HEIGHT - 30), self.small_font, GRAY)
 
     def draw_help(self):
         game = self.game
@@ -756,6 +793,7 @@ class App:
                 ("Space", "Shoot lasers (hold it down to keep firing)"),
                 ("B", "Fire a bomb - blows up every alien on screen"),
                 ("Esc", "Go back to the menu"),
+                ("Touch", "Hold to shoot, swipe to move, double tap for a bomb"),
             ]),
             ("ALIENS", [
                 (game.alien_img, "Parks at the top and shoots red lasers. Dodge!"),
@@ -819,8 +857,10 @@ class App:
         cursor = "|" if (now // 400) % 2 == 0 else " "
         self.text(self.name + cursor, box.center, self.name_font(self.name), YELLOW if self.name_fresh else WHITE)
         self.text("Type to change it", (WIDTH // 2, 425), self.small_font, GRAY)
-        self.button("ANOTHER NAME (Tab)", pygame.Rect(165, 465, 270, 54), self.suggest_name, CYAN)
-        self.button("SAVE (Enter)", pygame.Rect(165, 535, 270, 54), self.save_ranking)
+        self.button("ANOTHER NAME", pygame.Rect(165, 465, 270, 54), self.suggest_name, CYAN)
+        self.button("SAVE", pygame.Rect(165, 535, 270, 54), self.save_ranking)
+        if IS_WEB:
+            self.button("TYPE MY OWN", pygame.Rect(165, 605, 270, 54), self.type_name, ORANGE)
 
     def draw_rankings_screen(self):
         self.text("RANKINGS", (WIDTH // 2, 80), self.big_font, YELLOW)
@@ -834,8 +874,14 @@ class App:
         if self.state == "play":
             self.game.update(now)
             self.game.draw(self.screen, self.font, self.big_font, now)
-            if self.game.game_over and now - self.game.over_time >= GAME_OVER_PAUSE_MS:
-                self.finish_game()
+            if self.game.game_over:
+                if now - self.game.over_time >= GAME_OVER_PAUSE_MS:
+                    self.finish_game()
+                return
+            # on-screen buttons so the game can be played without a keyboard
+            self.button("MENU", pygame.Rect(10, HEIGHT - 56, 92, 46), self.leave_game, GRAY)
+            self.button(f"BOMB {self.game.bombs}", pygame.Rect(WIDTH - 122, HEIGHT - 56, 112, 46),
+                        lambda: self.game.use_bomb(now), PURPLE, self.game.bombs > 0)
             return
         self.game.scroll_stars()
         self.game.draw_stars(self.screen)
