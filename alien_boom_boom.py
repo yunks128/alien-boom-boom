@@ -8,6 +8,8 @@ import asyncio
 import json
 import random
 import sys
+import threading
+import urllib.request
 from pathlib import Path
 
 import pygame
@@ -80,6 +82,11 @@ COOLDOWN_PER_UPGRADE_MS = 45
 
 SAVE_PATH = Path(__file__).with_name("alien_boom_boom_save.json")
 MAX_RANKINGS = 10
+# Shared online ranking (Firebase Realtime Database). Paste the database address here, e.g.
+# "https://alien-boom-boom-default-rtdb.firebaseio.com". Leave it empty to keep rankings
+# on each device only.
+LEADERBOARD_URL = ""
+LEADERBOARD_TIMEOUT_S = 5
 MAX_NAME_LEN = 16
 GAME_OVER_PAUSE_MS = 1500  # how long GAME OVER shows before the name screen
 FUN_NAMES = [
@@ -185,6 +192,47 @@ def write_save(save):
             SAVE_PATH.write_text(json.dumps(save, indent=2))
     except OSError as err:
         print(f"Could not save progress: {err}")
+
+
+def http(method, url, body=None):
+    """Send one web request and return the reply text, or None if it failed."""
+    if IS_WEB:
+        # in a browser, ask the page's own JavaScript to make the request
+        from platform import window
+        script = (
+            "(function(){try{var x=new XMLHttpRequest();"
+            f"x.open({json.dumps(method)},{json.dumps(url)},false);"
+            f"x.send({json.dumps(body) if body is not None else 'null'});"
+            "return x.status+'\\n'+x.responseText;}catch(e){return '0\\n';}})()"
+        )
+        status, _, text = str(window.eval(script)).partition("\n")
+        return text if status == "200" else None
+    try:
+        data = body.encode() if body is not None else None
+        request = urllib.request.Request(url, data=data, method=method)
+        with urllib.request.urlopen(request, timeout=LEADERBOARD_TIMEOUT_S) as reply:
+            return reply.read().decode()
+    except (OSError, ValueError):
+        return None
+
+
+def fetch_online_rankings():
+    """Top scores from the shared ranking, best first, or None if it can't be reached."""
+    query = f"/scores.json?orderBy=%22score%22&limitToLast={MAX_RANKINGS}"
+    try:
+        rows = json.loads(http("GET", LEADERBOARD_URL + query) or "")
+    except ValueError:
+        return None
+    if rows is None:
+        return []  # reachable, but nobody has a score yet
+    if not isinstance(rows, dict):
+        return None
+    rankings = []
+    for row in rows.values():
+        if isinstance(row, dict) and isinstance(row.get("score"), int) and isinstance(row.get("level"), int):
+            rankings.append({"name": str(row.get("name", "?"))[:MAX_NAME_LEN], "score": row["score"], "level": row["level"]})
+    rankings.sort(key=lambda entry: entry["score"], reverse=True)
+    return rankings
 
 
 class Game:
@@ -597,6 +645,8 @@ class App:
         self.name_fresh = False  # True while the name is an untouched suggestion
         self.earned = 0
         self.my_entry = None  # the ranking row from the game just played
+        self.online_rankings = None  # shared ranking once it has been downloaded
+        self.refresh_online()
         self.running = True
         self.touch_x = 0  # where the finger was last, to measure swipes
         self.last_tap = (-DOUBLE_TAP_MS, 0, 0)  # (time, x, y) of the last tap, to spot double taps
@@ -621,6 +671,29 @@ class App:
 
     def go(self, state):
         self.state = state
+        if state == "menu":
+            self.refresh_online()
+
+    def refresh_online(self, new_entry=None):
+        """Upload new_entry (if any) and download the shared ranking."""
+        if not LEADERBOARD_URL:
+            return
+
+        def work():
+            if new_entry:
+                http("POST", LEADERBOARD_URL + "/scores.json", json.dumps(new_entry))
+            rankings = fetch_online_rankings()
+            if rankings is not None:
+                self.online_rankings = rankings
+
+        if IS_WEB:
+            work()  # browsers have no threads here; the request is quick
+        else:
+            threading.Thread(target=work, daemon=True).start()  # don't freeze the game while waiting
+
+    def rankings(self):
+        """The shared ranking when it is available, otherwise this device's own."""
+        return self.save["rankings"] if self.online_rankings is None else self.online_rankings
 
     def quit(self):
         self.running = False
@@ -662,6 +735,7 @@ class App:
         self.save["rankings"] = rankings[:MAX_RANKINGS]
         self.save["last_name"] = name
         write_save(self.save)
+        self.refresh_online(self.my_entry)
         self.state = "rankings"
 
     # ----- input -----
@@ -754,13 +828,14 @@ class App:
             self.buttons.append((rect, action))
 
     def draw_rankings(self, top, limit):
-        rankings = self.save["rankings"][:limit]
+        rankings = self.rankings()[:limit]
         if not rankings:
             self.text("No scores yet - be the first!", (WIDTH // 2, top + 20), self.small_font, GRAY)
         for i, entry in enumerate(rankings):
             y = top + i * 34
-            color = YELLOW if entry is self.my_entry else WHITE
-            if entry is self.my_entry:
+            mine = entry == self.my_entry
+            color = YELLOW if mine else WHITE
+            if mine:
                 pygame.draw.rect(self.screen, NAVY, (70, y - 4, WIDTH - 140, 32), border_radius=6)
             place = self.font.render(f"{i + 1}.", True, color)
             self.screen.blit(place, (90, y))
@@ -864,6 +939,8 @@ class App:
 
     def draw_rankings_screen(self):
         self.text("RANKINGS", (WIDTH // 2, 80), self.big_font, YELLOW)
+        where = "Saved on this device" if self.online_rankings is None else "Shared with every player"
+        self.text(where, (WIDTH // 2, 128), self.small_font, GRAY)
         self.draw_rankings(150, MAX_RANKINGS)
         self.button("PLAY AGAIN", pygame.Rect(70, HEIGHT - 190, 220, 60), self.start_game)
         self.button("SHOP", pygame.Rect(310, HEIGHT - 190, 220, 60), lambda: self.go("shop"), CYAN)
